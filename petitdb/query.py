@@ -3,19 +3,22 @@
 Supported, and not much more:
 
     CREATE TABLE t (col type, ...)        types: int, float, str, bool
+    CREATE INDEX ON t (col)               hash index, equality lookups
     INSERT INTO t [(cols)] VALUES (...)
-    SELECT * | cols FROM t [WHERE ...] [ORDER BY col [ASC|DESC]] [LIMIT n]
+    SELECT * | cols | COUNT(*) FROM t [WHERE ...] [ORDER BY col [ASC|DESC]] [LIMIT n]
+    UPDATE t SET col = val [, ...] [WHERE ...]
     DELETE FROM t [WHERE ...]
+    EXPLAIN SELECT ...                     show the planner's access path
     DROP TABLE t
 
 WHERE is a chain of `col <op> literal` joined by AND. Operators: = == != <> < <= > >=.
-No joins, no subqueries, no aggregates -- on purpose.
+No joins, no subqueries, no aggregates beyond COUNT(*) -- on purpose.
 """
 
-import operator
 import re
 
 from .database import PetitDBError
+from .predicate import CMP, Comparison, Where
 
 _TOKEN = re.compile(
     r"""
@@ -27,13 +30,6 @@ _TOKEN = re.compile(
     """,
     re.VERBOSE,
 )
-
-_OPS = {
-    "=": operator.eq, "==": operator.eq,
-    "!=": operator.ne, "<>": operator.ne,
-    "<": operator.lt, "<=": operator.le,
-    ">": operator.gt, ">=": operator.ge,
-}
 
 
 def tokenize(sql):
@@ -101,25 +97,30 @@ def _literal(s):
 def _comparison(s):
     col = s.word()
     okind, opv = s.next()
-    if okind != "op":
+    if okind != "op" or opv not in CMP:
         raise PetitDBError(f"expected a comparison operator, got {opv!r}")
-    rhs = _literal(s)
-    fn = _OPS[opv]
-    return lambda row: col in row and fn(row[col], rhs)
+    return Comparison(col, opv, _literal(s))
 
 
 def _condition(s):
-    preds = [_comparison(s)]
+    conds = [_comparison(s)]
     while s.at_word("AND"):
         s.next()
-        preds.append(_comparison(s))
-    return lambda row: all(p(row) for p in preds)
+        conds.append(_comparison(s))
+    return Where(conds)
 
 
-def _select(db, s):
-    if s.peek() == ("punc", "*"):
+def _parse_select(s):
+    count = False
+    cols = None
+    if s.at_word("COUNT"):
         s.next()
-        cols = None
+        s.expect_punc("(")
+        s.expect_punc("*")
+        s.expect_punc(")")
+        count = True
+    elif s.peek() == ("punc", "*"):
+        s.next()
     else:
         cols = [s.word()]
         while s.peek() == ("punc", ","):
@@ -147,10 +148,34 @@ def _select(db, s):
         if kind != "num":
             raise PetitDBError(f"expected a number after LIMIT, got {val!r}")
         limit = int(val)
-    return db.table(name).select(cols, where, order_by, desc, limit)
+    return {"count": count, "cols": cols, "name": name,
+            "where": where, "order_by": order_by, "desc": desc, "limit": limit}
+
+
+def _select(db, s):
+    q = _parse_select(s)
+    table = db.table(q["name"])
+    if q["count"]:
+        return [{"count": table.count(q["where"])}]
+    return table.select(q["cols"], q["where"], q["order_by"], q["desc"], q["limit"])
+
+
+def _explain(db, s):
+    s.expect_word("SELECT")
+    q = _parse_select(s)
+    return db.table(q["name"]).explain(q["where"])
 
 
 def _create(db, s):
+    if s.at_word("INDEX"):
+        s.next()
+        s.expect_word("ON")
+        name = s.word()
+        s.expect_punc("(")
+        col = s.word()
+        s.expect_punc(")")
+        db.create_index(name, col)
+        return None
     s.expect_word("TABLE")
     name = s.word()
     s.expect_punc("(")
@@ -194,6 +219,27 @@ def _insert(db, s):
     return table.insert(dict(zip(cols, vals)))
 
 
+def _update(db, s):
+    name = s.word()
+    s.expect_word("SET")
+    changes = {}
+    while True:
+        col = s.word()
+        _, opv = s.next()
+        if opv not in ("=", "=="):
+            raise PetitDBError(f"expected '=' in SET, got {opv!r}")
+        changes[col] = _literal(s)
+        if s.peek() == ("punc", ","):
+            s.next()
+            continue
+        break
+    where = None
+    if s.at_word("WHERE"):
+        s.next()
+        where = _condition(s)
+    return db.table(name).update(changes, where)
+
+
 def _delete(db, s):
     s.expect_word("FROM")
     name = s.word()
@@ -213,14 +259,17 @@ _DISPATCH = {
     "CREATE": _create,
     "INSERT": _insert,
     "SELECT": _select,
+    "UPDATE": _update,
     "DELETE": _delete,
+    "EXPLAIN": _explain,
     "DROP": _drop,
 }
 
 
 def execute(db, sql):
-    """Run one statement. SELECT returns a list of row dicts; INSERT returns the
-    new row id; DELETE returns a count; the rest return None."""
+    """Run one statement. SELECT returns a list of row dicts; COUNT(*) a
+    one-row list; INSERT the new row id; UPDATE/DELETE a count; EXPLAIN a plan
+    string; the rest return None."""
     sql = sql.strip().rstrip(";").strip()
     if not sql:
         return None

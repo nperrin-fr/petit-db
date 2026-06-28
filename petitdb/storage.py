@@ -3,6 +3,7 @@
 Each table is persisted as a JSONL log. Every line is one operation:
 
     {"op": "insert", "id": <int>, "row": {...}}
+    {"op": "update", "id": <int>, "row": {...}}   # full row after the change
     {"op": "delete", "id": <int>}
 
 Replaying the log left-to-right reconstructs the live rows. This is a small
@@ -31,7 +32,7 @@ class LogStore:
                 if not line:
                     continue
                 op = json.loads(line)
-                if op["op"] == "insert":
+                if op["op"] in ("insert", "update"):
                     rows[op["id"]] = op["row"]
                 elif op["op"] == "delete":
                     rows.pop(op["id"], None)

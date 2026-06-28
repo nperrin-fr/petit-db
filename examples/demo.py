@@ -37,6 +37,25 @@ def main():
     for row in todo:
         print(f"  - {row['topic']}")
 
+    # --- the planner: an index changes the access path ---
+    execute(db, "CREATE TABLE people (name str, city str)")
+    for name, city in [("Ada", "Lausanne"), ("Bob", "Geneva"), ("Cleo", "Lausanne")]:
+        execute(db, f"INSERT INTO people VALUES ('{name}', '{city}')")
+
+    print("\nplanner — before and after an index on city:")
+    select_lausanne = "SELECT * FROM people WHERE city = 'Lausanne'"
+    count_lausanne = "SELECT COUNT(*) FROM people WHERE city = 'Lausanne'"
+
+    print(f"  {execute(db, 'EXPLAIN ' + select_lausanne)}")
+    execute(db, "CREATE INDEX ON people (city)")
+    print(f"  {execute(db, 'EXPLAIN ' + select_lausanne)}")
+    print(f"  count in Lausanne: {execute(db, count_lausanne)[0]['count']}")
+
+    # --- update, with the index kept in sync ---
+    execute(db, "UPDATE people SET city = 'Bern' WHERE name = 'Ada'")
+    print(f"  after moving Ada to Bern, Lausanne now has "
+          f"{execute(db, count_lausanne)[0]['count']}")
+
 
 if __name__ == "__main__":
     main()

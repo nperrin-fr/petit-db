@@ -88,6 +88,81 @@ class TestSql(unittest.TestCase):
             execute(self.db, "SELEKT * FROM nope")
 
 
+class TestUpdate(unittest.TestCase):
+    def test_update_api(self):
+        db = Database()
+        t = db.create_table("p", {"name": "str", "age": "int"})
+        t.insert_many([{"name": "a", "age": 1}, {"name": "b", "age": 2}])
+        changed = t.update({"age": 9}, where=lambda r: r["name"] == "a")
+        self.assertEqual(changed, 1)
+        self.assertEqual(t.select(where=lambda r: r["name"] == "a")[0]["age"], 9)
+
+    def test_update_sql(self):
+        db = Database()
+        execute(db, "CREATE TABLE p (name str, age int)")
+        execute(db, "INSERT INTO p VALUES ('a', 1)")
+        execute(db, "INSERT INTO p VALUES ('b', 2)")
+        n = execute(db, "UPDATE p SET age = 99 WHERE name = 'b'")
+        self.assertEqual(n, 1)
+        rows = execute(db, "SELECT name, age FROM p ORDER BY name")
+        self.assertEqual(rows, [{"name": "a", "age": 1}, {"name": "b", "age": 99}])
+
+    def test_update_rejects_unknown_column(self):
+        db = Database()
+        db.create_table("p", {"name": "str"})
+        with self.assertRaises(PetitDBError):
+            db.table("p").update({"nope": 1})
+
+
+class TestCount(unittest.TestCase):
+    def test_count_sql(self):
+        db = Database()
+        execute(db, "CREATE TABLE n (x int)")
+        for i in range(5):
+            execute(db, f"INSERT INTO n VALUES ({i})")
+        self.assertEqual(execute(db, "SELECT COUNT(*) FROM n"), [{"count": 5}])
+        self.assertEqual(execute(db, "SELECT COUNT(*) FROM n WHERE x >= 3"), [{"count": 2}])
+
+
+class TestIndex(unittest.TestCase):
+    def setUp(self):
+        self.db = Database()
+        execute(self.db, "CREATE TABLE people (name str, city str, age int)")
+        execute(self.db, "INSERT INTO people VALUES ('Ada', 'Lausanne', 36)")
+        execute(self.db, "INSERT INTO people VALUES ('Bob', 'Geneva', 41)")
+        execute(self.db, "INSERT INTO people VALUES ('Cleo', 'Lausanne', 29)")
+
+    def test_explain_switches_path(self):
+        plan = execute(self.db, "EXPLAIN SELECT * FROM people WHERE city = 'Lausanne'")
+        self.assertEqual(plan, "Seq scan on people")
+        execute(self.db, "CREATE INDEX ON people (city)")
+        plan = execute(self.db, "EXPLAIN SELECT * FROM people WHERE city = 'Lausanne'")
+        self.assertEqual(plan, "Index lookup on people.city")
+
+    def test_index_returns_same_rows_as_scan(self):
+        scan = execute(self.db, "SELECT name FROM people WHERE city = 'Lausanne' ORDER BY name")
+        execute(self.db, "CREATE INDEX ON people (city)")
+        indexed = execute(self.db, "SELECT name FROM people WHERE city = 'Lausanne' ORDER BY name")
+        self.assertEqual(indexed, scan)
+        self.assertEqual([r["name"] for r in indexed], ["Ada", "Cleo"])
+
+    def test_index_only_for_equality(self):
+        execute(self.db, "CREATE INDEX ON people (age)")
+        # range query can't use the hash index -> still a seq scan
+        plan = execute(self.db, "EXPLAIN SELECT * FROM people WHERE age > 30")
+        self.assertEqual(plan, "Seq scan on people")
+
+    def test_index_tracks_writes(self):
+        execute(self.db, "CREATE INDEX ON people (city)")
+        idx = self.db.table("people").indexes["city"]
+        self.assertEqual(len(idx.lookup("Lausanne")), 2)
+        execute(self.db, "UPDATE people SET city = 'Bern' WHERE name = 'Ada'")
+        self.assertEqual(len(idx.lookup("Lausanne")), 1)
+        self.assertEqual(len(idx.lookup("Bern")), 1)
+        execute(self.db, "DELETE FROM people WHERE name = 'Cleo'")
+        self.assertEqual(idx.lookup("Lausanne"), ())
+
+
 class TestPersistence(unittest.TestCase):
     def test_log_survives_reopen(self):
         with tempfile.TemporaryDirectory() as d:
@@ -104,6 +179,28 @@ class TestPersistence(unittest.TestCase):
             # ids keep climbing after reload (no reuse of deleted id)
             new_id = execute(reopened, "INSERT INTO t VALUES (9, 'Cleo')")
             self.assertEqual(new_id, 3)
+
+    def test_update_op_survives_reopen(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = Database(d)
+            execute(db, "CREATE TABLE t (id int, name str)")
+            execute(db, "INSERT INTO t VALUES (1, 'Ada')")
+            execute(db, "UPDATE t SET name = 'Adele' WHERE id = 1")
+
+            reopened = Database(d)
+            self.assertEqual(execute(reopened, "SELECT name FROM t"), [{"name": "Adele"}])
+
+    def test_index_survives_reopen(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = Database(d)
+            execute(db, "CREATE TABLE t (id int, city str)")
+            execute(db, "INSERT INTO t VALUES (1, 'Lausanne')")
+            execute(db, "CREATE INDEX ON t (city)")
+
+            reopened = Database(d)
+            self.assertIn("city", reopened.table("t").indexes)
+            plan = execute(reopened, "EXPLAIN SELECT * FROM t WHERE city = 'Lausanne'")
+            self.assertEqual(plan, "Index lookup on t.city")
 
     def test_compaction_preserves_rows(self):
         with tempfile.TemporaryDirectory() as d:

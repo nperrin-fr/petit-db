@@ -34,7 +34,8 @@ def run(path=None):
         if line in (".exit", ".quit"):
             break
         if line == ".help":
-            print("statements: CREATE TABLE, INSERT, SELECT, DELETE, DROP TABLE")
+            print("statements: CREATE TABLE, CREATE INDEX, INSERT, SELECT, UPDATE,")
+            print("            DELETE, EXPLAIN SELECT, DROP TABLE")
             print("commands:   .tables, .exit")
             continue
         if line == ".tables":
@@ -47,6 +48,8 @@ def run(path=None):
             continue
         if isinstance(result, list):
             _print_rows(result)
+        elif isinstance(result, str):
+            print(result)            # EXPLAIN plan
         elif isinstance(result, int):
             print(f"{result} row(s) affected")
         else:
